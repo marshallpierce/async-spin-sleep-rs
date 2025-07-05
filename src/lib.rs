@@ -324,7 +324,7 @@ impl Handle {
     }
 
     /// Create an interval controller which wakes up after specified `interval` duration on
-    /// every call to [`util::Interval::wait`]
+    /// every call to [`util::Interval::tick`]
     pub fn interval(&self, interval: Duration) -> util::Interval {
         util::Interval { handle: self.clone(), wakeup_time: Instant::now() + interval, interval }
     }
@@ -345,7 +345,7 @@ pub mod util {
     impl Interval {
         /// Wait until next interval.
         ///
-        /// This function will return [`SleepResult`] which contains the duration that overly passed
+        /// This function will return [`Report`] which contains the duration that overly passed
         /// the specified interval. As it internally aligns to the specified interval, it should not
         /// be drifted over time, in terms of [`Instant`] clock domain.
         ///
@@ -374,7 +374,7 @@ pub mod util {
             result
         }
 
-        /// A shortcut for [`tick_with_min_interval`] with `minimum_interval` set to half.
+        /// A shortcut for [`Self::tick_with_min_interval`] with `minimum_interval` set to half.
         pub async fn tick(&mut self) -> Report {
             self.tick_with_min_interval(self.interval / 2).await
         }
@@ -450,7 +450,7 @@ pub mod util {
             self.interval = interval;
         }
 
-        /// Shortcut for [`Self::align_clock`] from now.
+        /// Shortcut for [`Self::align_with_clock`] from now.
         pub fn align_now(
             &mut self,
             interval: Option<Duration>,
@@ -465,7 +465,7 @@ pub mod util {
             );
         }
 
-        /// Shortcut for [`Self::align_clock`] with [`std::time::SystemTime`] as the time source.
+        /// Shortcut for [`Self::align_with_clock`] with [`std::time::SystemTime`] as the time source.
         #[cfg(feature = "system-clock")]
         pub fn align_with_system_clock(
             &mut self,
@@ -523,7 +523,7 @@ pub enum Report {
     /// Timer has not been requested as the timeout is already expired.
     ExpiredTimer(Duration),
 
-    /// We woke up a bit earlier than required. It is usually hundreads of nanoseconds.
+    /// We woke up a bit earlier than required. It is usually hundreds of nanoseconds.
     CompletedEarly(Duration),
 }
 
@@ -559,7 +559,10 @@ impl Report {
 
 #[derive(Debug)]
 enum SleepState {
+    /// Initial state - waiting for first poll to register with driver
     Pending(channel::Sender<driver::Event>),
+    /// Waiting for driver to wake.
+    /// Keeps driver's weak waker alive.
     Sleeping(Arc<WakerNode>),
     Woken,
 }
