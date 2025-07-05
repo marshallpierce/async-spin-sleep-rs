@@ -142,7 +142,7 @@ mod driver {
     pub(crate) fn execute<const D: usize>(this: Builder, rx: channel::Receiver<Event>) {
         let mut nodes = DaryHeap::<Node, D>::new();
         let pivot = Instant::now();
-        let to_usec = |x: Instant| x.duration_since(pivot).as_micros() as u64;
+        let to_usec = |x: Instant| x.saturating_duration_since(pivot).as_micros() as u64;
         let resolution_usec = this.schedule_resolution.as_micros() as u64;
 
         // As each node always increment the `gc_counter` by 1 when dropped, and the worker
@@ -156,10 +156,10 @@ mod driver {
             let now = to_usec(now_ts);
             let mut event = if let Some(node) = nodes.peek() {
                 let remain = node.timeout_usec.saturating_sub(now);
-                if remain > resolution_usec {
-                    let system_sleep_for = remain - resolution_usec;
-                    let timeout = Duration::from_micros(system_sleep_for);
-                    let deadline = now_ts + timeout;
+                if let Some(system_sleep_for) = remain.checked_sub(resolution_usec) {
+                    // Would only panic if node timout was representable, but this intermediate
+                    // point that's sooner than the node timeout was not
+                    let deadline = now_ts + Duration::from_micros(system_sleep_for);
 
                     let Ok(event) = rx.recv_deadline(deadline).map_err(|e| match e {
                         channel::RecvTimeoutError::Timeout => (),
@@ -181,10 +181,12 @@ mod driver {
                     'busy_wait: loop {
                         let now = to_usec(Instant::now());
                         if now >= node.timeout_usec {
-                            let node = nodes.pop().unwrap();
+                            let node = nodes.pop().expect("node presence checked via peek()");
 
-                            if let Some(waker) = node.weak_waker.upgrade() {
-                                waker.value.lock().take().expect("logic error").wake();
+                            if let Some(waker) =
+                                node.weak_waker.upgrade().and_then(|wn| wn.value.lock().take())
+                            {
+                                waker.wake();
                             }
 
                             let n_garbage = gc_counter.fetch_sub(1, Ordering::Release);
@@ -588,13 +590,22 @@ impl std::future::Future for SleepFuture {
                 waker: Arc::downgrade(&waker),
             });
 
-            tx.send(event).expect("timer driver instance dropped!");
+            if tx.send(event).is_err() {
+                // Driver has gone away, so this task will never be woken later.
+                // `timeout` <= now, otherwise it would have matched the check above.
+                self.state = SleepState::Woken;
+                return Poll::Ready(Report::CompletedEarly(
+                    self.timeout.saturating_duration_since(now),
+                ));
+            }
             self.state = SleepState::Sleeping(waker);
         } else if let SleepState::Sleeping(node) = &self.state {
             // We woke up too early. Check if it is due to broken clock monotonicity.
             if node.is_expired() {
                 self.state = SleepState::Woken;
-                return Poll::Ready(Report::CompletedEarly(self.timeout - now));
+                return Poll::Ready(Report::CompletedEarly(
+                    self.timeout.saturating_duration_since(now),
+                ));
             } else {
                 // If not, this is a spurious wakeup. We should sleep again.
                 // - XXX: Should we re-register wakeup timer here?
