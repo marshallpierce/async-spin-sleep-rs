@@ -137,6 +137,7 @@ mod driver {
     #[derive(Debug)]
     pub(crate) enum Event {
         SleepUntil(NodeDesc),
+        Shutdown,
     }
 
     pub(crate) fn execute<const D: usize>(this: Builder, rx: channel::Receiver<Event>) {
@@ -229,6 +230,21 @@ mod driver {
                 match event {
                     Event::SleepUntil(desc) => nodes
                         .push(Node { timeout_usec: to_usec(desc.timeout), weak_waker: desc.waker }),
+                    Event::Shutdown => {
+                        // Wake remaining timers so they aren't stuck forever. This should cause
+                        // CompletedEarly for the affected timers.
+
+                        for n in nodes {
+                            if let Some(waker) =
+                                n.weak_waker.upgrade().and_then(|wn| wn.value.lock().take())
+                            {
+                                waker.wake();
+                            }
+                        }
+
+                        // Return, not break, to avoid hitting asserts below that may not be true in this case
+                        return;
+                    }
                 };
 
                 event = match rx.try_recv() {
@@ -329,6 +345,14 @@ impl Handle {
     /// every call to [`util::Interval::wait`]
     pub fn interval(&self, interval: Duration) -> util::Interval {
         util::Interval { handle: self.clone(), wakeup_time: Instant::now() + interval, interval }
+    }
+
+    /// Signal the driver to shut down, causing the thread it is running in to exit gracefully.
+    ///
+    /// Existing timers will fire immediately.
+    pub fn shutdown(self) {
+        // if rx is already dropped, we're done anyway
+        let _ = self.tx.send(driver::Event::Shutdown);
     }
 }
 
@@ -525,7 +549,9 @@ pub enum Report {
     /// Timer has not been requested as the timeout is already expired.
     ExpiredTimer(Duration),
 
-    /// We woke up a bit earlier than required. It is usually hundreads of nanoseconds.
+    /// We woke up a bit earlier than required. It is usually hundreds of nanoseconds.
+    ///
+    /// This is also produced by extant timers when the driver is shut down.
     CompletedEarly(Duration),
 }
 
